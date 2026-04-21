@@ -6,6 +6,313 @@ img: submarine.png
 alt: image-alt
 project-date: April 2014
 client: Start Bootstrap
-category: Web Development
-description: Use this area of the page to describe your project. Lorem ipsum dolor sit amet, consectetur adipisicing elit. Mollitia neque assumenda ipsam nihil, molestias magnam, recusandae quos quis inventore quisquam velit asperiores, vitae? Reprehenderit soluta, eos quod consequuntur itaque. Nam.
+category: LLM
+description: A Beginner‑Friendly Guide to Single‑Head vs Multi‑Head Attention (MHA) and KV‑Caching
 ---
+
+# A Beginner‑Friendly Guide to Single‑Head vs Multi‑Head Attention (MHA) and KV‑Caching
+
+
+Transformers have changed how we think about sequence modeling, and at the heart of these models is the **attention mechanism**. In this blog, we’ll walk step by step through:
+
+- what `d_model` and `D` mean,  
+- the difference between single‑head and multi‑head attention,  
+- why the KV‑cache formula is \(2 \times L \times H \times D\),  
+- and how Grouped‑Query Attention (GQA) and Multi‑Query Attention (MQA) build on this.
+
+All of this is explained via **concrete examples** with small numbers so you can see exactly what happens inside the model.
+
+***
+
+## 1. What do `d_model` and `D` mean?
+
+Before we talk about attention, let’s clarify two common symbols:
+
+- **`d_model`** is the **embedding / hidden size** per token.  
+- **`D`** (also called `d_head`) is the **dimension of each attention head**.
+
+For example, assume:
+
+- \(d_\text{model} = 512\): every token is represented as a 512‑dimensional vector.  
+- Number of heads \(H = 4\).  
+
+Then, the head dimension must satisfy:
+
+\[
+d_\text{model} = H \times D
+\]
+
+So:
+
+\[
+D = \frac{d_\text{model}}{H} = \frac{512}{4} = 128
+\]
+
+In short:
+
+- **`d_model`** = the total width of the model per token.  
+- **`D`** = the width of each “lane” when you split that total width into `H` parallel heads.  
+
+This is important because queries, keys, and values are all computed in these dimensions.
+
+***
+
+## 2. Single‑head attention: one big lens
+
+Let’s look at a specific setup:
+
+- \(d_\text{model} = 512\)  
+- \(H = 1\) head  
+- \(D = 512\)  
+- \(L = 101\) tokens  
+- batch size \(B = 1\)
+
+### Step 1: Input and embedding
+
+- Input: 101 tokens.  
+- Each token is mapped to a 512‑dim vector.  
+- Shape:  
+  \[
+  X \in \mathbb{R}^{1 \times 101 \times 512}
+  \]
+
+### Step 2: Project to Q, K, V
+
+Three linear projections:
+
+- \(W_Q, W_K, W_V \in \mathbb{R}^{512 \times 512}\)
+
+Apply them:
+
+\[
+Q = X W_Q \quad\in \mathbb{R}^{1 \times 101 \times 512}
+\]
+\[
+K = X W_K \quad\in \mathbb{R}^{1 \times 101 \times 512}
+\]
+\[
+V = X W_V \quad\in \mathbb{R}^{1 \times 101 \times 512}
+\]
+
+Because there is only one head, we don’t need to reshape; everything stays in 512‑D.
+
+### Step 3: Compute attention scores
+
+Scaled dot‑product attention:
+
+\[
+\text{scores} = Q K^T \in \mathbb{R}^{1 \times 101 \times 101}
+\]
+
+This is a **101 × 101** matrix of attention scores; each row tells one token “how much it attends to the other 101 tokens.”
+
+Apply softmax over the last dimension:
+
+\[
+\text{attn} = \text{softmax}(\text{scores}) \in \mathbb{R}^{1 \times 101 \times 101}
+\]
+
+### Step 4: Weighted‑sum output
+
+\[
+\text{attn\_out} = \text{attn} \cdot V \in \mathbb{R}^{1 \times 101 \times 512}
+\]
+
+Then, typically:
+
+\[
+Z = X + \text{attn\_out} \in \mathbb{R}^{1 \times 101 \times 512}
+\]
+
+followed by layer normalization (same shape).
+
+***
+
+## 3. Multi‑head attention (4 heads): many parallel lenses
+
+Now keep \(d_\text{model} = 512\), \(L = 101\), \(B = 1\), but use:
+
+- \(H = 4\) heads  
+- \(D = 128\) (because \(4 \times 128 = 512\))
+
+The overall **input** and **final output** dimensions stay the same:
+
+\[
+X \in \mathbb{R}^{1 \times 101 \times 512},\quad
+Z \in \mathbb{R}^{1 \times 101 \times 512}
+\]
+
+but the work inside is split differently.
+
+### Step 1: Project Q, K, V
+
+Same as before:
+
+\[
+Q, K, V \in \mathbb{R}^{1 \times 101 \times 512}
+\]
+
+Now reshape along the last dimension to split into 4 heads of 128:
+
+\[
+Q^{\text{head}} \in \mathbb{R}^{1 \times 101 \times 4 \times 128}
+\]
+
+and similarly for \(K^{\text{head}}, V^{\text{head}}\).
+
+### Step 2: Per‑head attention
+
+For each head \(h = 1,\dots,4\):
+
+- \(Q_h, K_h, V_h \in \mathbb{R}^{1 \times 101 \times 128}\)  
+- Compute scores:  
+  \[
+  \text{scores}_h = Q_h K_h^T \in \mathbb{R}^{101 \times 101}
+  \]
+- Softmax:  
+  \[
+  \text{attn}_h \in \mathbb{R}^{101 \times 101}
+  \]
+- Weighted‑sum:  
+  \[
+  O_h \in \mathbb{R}^{101 \times 128}
+  \]
+
+So you compute **4 separate 101 × 101 attention matrices** and get **4 outputs of 128‑D each**.
+
+### Step 3: Concatenate heads and project
+
+- Concatenate heads:  
+  \[
+  O_{\text{cat}} = [O_1, O_2, O_3, O_4] \in \mathbb{R}^{1 \times 101 \times 512}
+  \]
+- Apply final projection \(W_O \in \mathbb{R}^{512 \times 512}\):  
+  \[
+  \text{attn\_out} \in \mathbb{R}^{1 \times 101 \times 512}
+  \]
+
+Residual + layer‑norm keeps the same shape:
+
+\[
+Z \in \mathbb{R}^{1 \times 101 \times 512}
+\]
+
+Multi‑head attention thus **splits the 512‑D space into 4 specialized 128‑D heads**, then combines them back into the same 512‑D representation.
+
+***
+
+## 4. Why is the KV‑cache \(2 \times L \times H \times D\)?
+
+During inference, Transformers reuse information from already‑generated tokens. The **key** (K) and **value** (V) vectors for past tokens are stored in the **KV‑cache** so they don’t need to be recomputed.
+
+The KV‑cache for one layer, one batch, and one head stores:
+
+- for each token (length \(L\))  
+- for each head (\(H\))  
+- for each head dimension (\(D\))  
+
+Both **K** and **V** are stored, hence the factor of 2.
+
+So:
+
+\[
+\text{KV‑cache elements} =
+2 \times L \times H \times D
+\]
+
+### Intuition: Queries vs Keys/Values
+
+- **Keys and Values** are “past state”: once computed for a token, they are stored so later tokens can attend to them.  
+- **Queries** are “current”: computed on‑the‑fly for each new token and then discarded. They are **not cached**, so query size does not appear in the KV‑cache formula.  
+
+### Concrete example
+
+Take \(L = 101\), \(H = 1\), \(D = 512\):
+
+\[
+2 \times 101 \times 1 \times 512 = 103{,}040 \text{ elements}
+\]
+
+Now change to \(H = 4\), \(D = 128\):
+
+\[
+2 \times 101 \times 4 \times 128 = 103{,}040 \text{ elements}
+\]
+
+The **total KV‑cache size is the same**, but:
+
+- single‑head: 1 big 512‑D head  
+- 4‑head: 4 small 128‑D heads  
+
+This is why multi‑head attention does not increase KV‑cache size; it just reorganizes the computation.
+
+***
+
+## 5. Single‑head vs multi‑head: side‑by‑side overview
+
+Here is a compact comparison (same \(d_\text{model} = 512\), \(L = 101\), \(B = 1\)):
+
+| Aspect | Single‑head (\(H=1\)) | 4‑head (\(H=4\)) |
+| --- | --- | --- |
+| Input shape \(X\) | \(\mathbb{R}^{1 \times 101 \times 512}\) | \(\mathbb{R}^{1 \times 101 \times 512}\) |
+| Q, K, V after projection | \(\mathbb{R}^{1 \times 101 \times 512}\) | \(\mathbb{R}^{1 \times 101 \times 512}\) |
+| After head splitting | \(Q/K/V \in \mathbb{R}^{1 \times 101 \times 512}\) (1 head) | \(Q^\text{head} \in \mathbb{R}^{1 \times 101 \times 4 \times 128}\) |
+| Attention scores | 1 matrix \(\mathbb{R}^{101 \times 101}\) | 4 matrices \(\mathbb{R}^{101 \times 101}\) |
+| Total attention scores | 10,201 | 40,804 |
+| Output per head | 1 × \(\mathbb{R}^{101 \times 512}\) | 4 × \(\mathbb{R}^{101 \times 128}\) |
+| After concatenation | Already \(\mathbb{R}^{101 \times 512}\) | \(\mathbb{R}^{101 \times 512}\) |
+| Final attention output \(Z\) | \(\mathbb{R}^{1 \times 101 \times 512}\) | \(\mathbb{R}^{1 \times 101 \times 512}\) |
+| KV‑cache elements | \(2 \times 101 \times 1 \times 512 = 103{,}040\) | \(2 \times 101 \times 4 \times 128 = 103{,}040\) |
+
+**Key idea:** multi‑head attention keeps the same input and output shapes and the same total KV‑cache size; it simply distributes the computation into multiple smaller heads, which can learn different types of patterns in parallel.
+
+***
+
+## 6. How GQA and MQA build on this
+
+Modern large models replace full Multi‑Head Attention (MHA) with **Grouped‑Query Attention (GQA)** or **Multi‑Query Attention (MQA)** to reduce memory and compute.
+
+### MQA (Multi‑Query Attention)
+
+- All queries share **one KV head** across all heads.  
+- KV‑cache size: \(2 \times L \times 1 \times D\)  
+- **Smallest KV‑cache and fastest**, but **weaker modeling capacity** because all heads see the same K/V.
+
+### GQA (Grouped‑Query Attention)
+
+- Split \(H\) query heads into \(G\) groups, each with its own KV head.  
+- KV‑cache size: \(2 \times L \times G \times D\)  
+
+If \(H = 32\), \(G = 8\), \(D = 128\) (typical large‑language‑model setup):
+
+- MHA: \(2 \times L \times 32 \times 128\) → full cache  
+- GQA: \(2 \times L \times 8 \times 128\) → ¼ of MHA  
+- MQA: \(2 \times L \times 1 \times 128\) → ~1/32 of MHA  
+
+**Trade‑off:**
+
+- MQA: fastest, smallest memory, lowest quality.  
+- GQA: good balance: MHA‑like quality with much smaller cache and faster inference.  
+
+In practice, GQA‑8 is now the default in many 30B–70B models; MQA is used when latency or memory is more important than squeezing out the last bit of quality.
+
+***
+
+## 7. Wrapping up
+
+We’ve walked through:
+
+- how `d_model` and `D` relate to each other and to attention heads,  
+- how single‑head attention works with big 512‑D vectors,  
+- how multi‑head attention splits 512‑D into 4 × 128‑D heads but keeps the same input and output shapes,  
+- why the KV‑cache formula is \(2 \times L \times H \times D\),  
+- and how GQA and MQA compress the KV‑cache by sharing KV heads across query heads.
+
+If you remember just a few things:
+
+- `d_model = H × D`: heads divide the embedding space.  
+- single‑head = one big 512‑D attention; multi‑head = multiple smaller heads in parallel.  
+- KV‑cache stores K and V, not Q, which is why the formula is \(2 \times L \times H \times D\).  
+- GQA and MQA reduce the number of KV heads to speed up inference and cut memory, with GQA sitting in the sweet spot between MHA and MQA.
+
+If you tell me your exact model size (layers, heads, context length), I can even show you a tiny table that computes the **exact KV‑cache size in MB/GB** for both MHA and GQA for your setup.
